@@ -60,15 +60,6 @@ const CONFIG = {
 };
 ```
 
-## 🛠️ Manual Installation
-
-1. Install [Tampermonkey](https://www.tampermonkey.net/) for Firefox  
-2. Open `accessibility-reader.user.js` and copy the contents  
-3. In Tampermonkey, create a new script and paste the code  
-4. Update the `@match` URLs in the metadata block if your institution uses a different domain  
-5. Save the script and navigate to a course page  
-
-
 ## ⌨️ All Hotkeys
 
 | Key | Action |
@@ -84,6 +75,10 @@ const CONFIG = {
 
 This project is in active development. Content reading is functional.  
 **Ask if there is something wrong. I want to help you have access to the learning resources you need.**
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Cfomodz/Open-edX-Accessibility-Reader&type=date&legend=top-left)](https://www.star-history.com/#Cfomodz/Open-edX-Accessibility-Reader&type=date&legend=top-left)
 
 ## 🤝 Contributing
 
