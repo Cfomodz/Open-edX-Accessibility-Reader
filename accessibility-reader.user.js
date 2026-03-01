@@ -6,6 +6,7 @@
 // @author       Cfomodz
 // @match        https://*.wgu.edu/learning/course/*
 // @match        https://*.wgu.edu/course/*
+// @match        https://*.wgu.edu/xblock/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -48,15 +49,15 @@
   // ═══════════════════════════════════════════════════════════════════════════
   // SELECTORS — Open edX / WGU Learning MFE
   //
-  // Architecture: The Learning MFE (parent page) embeds course content in an
-  // iframe. The content page has class "chromeless" and uses postMessage to
-  // communicate with the parent. Two execution contexts:
+  // Architecture: The Learning MFE (parent page) embeds course content in a
+  // cross-origin iframe (e.g. cgp-oex.wgu.edu). Two execution contexts:
   //
-  //   Parent (MFE):  Has course navigation (sequence bar, outline sidebar)
-  //   Content iframe: Has the xblock content (what gets read aloud)
+  //   Parent (MFE):    Has course navigation, TTS, UI panel, hotkeys
+  //   Content iframe:  Has the xblock content — acts as content provider
   //
-  // The script runs on the parent MFE page and reaches into the content
-  // iframe via contentDocument (same-origin).
+  // The script runs in BOTH contexts. The iframe instance extracts content
+  // and responds via postMessage. The parent instance requests content,
+  // drives TTS, and handles navigation.
   // ═══════════════════════════════════════════════════════════════════════════
 
   const SELECTORS = {
@@ -189,13 +190,30 @@
    */
   function speakChunk(text, voice = null) {
     return new Promise((resolve, reject) => {
+      log('[DEBUG speakChunk] Creating utterance, text length:', text.length);
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = CONFIG.TTS_RATE;
       utterance.pitch = CONFIG.TTS_PITCH;
       if (voice) utterance.voice = voice;
-      utterance.onend = () => resolve();
-      utterance.onerror = (e) => reject(e);
+
+      utterance.onstart = () => log('[DEBUG speakChunk] >> onstart fired — speech has begun');
+      utterance.onend = () => {
+        log('[DEBUG speakChunk] >> onend fired — speech finished');
+        resolve();
+      };
+      utterance.onerror = (e) => {
+        log('[DEBUG speakChunk] >> onerror fired:', e.error, '| type:', e.type, '| charIndex:', e.charIndex, '| elapsedTime:', e.elapsedTime);
+        reject(e);
+      };
+      utterance.onpause = () => log('[DEBUG speakChunk] >> onpause fired');
+      utterance.onresume = () => log('[DEBUG speakChunk] >> onresume fired');
+      utterance.onboundary = (e) => {
+        if (e.charIndex === 0) log('[DEBUG speakChunk] >> onboundary first word');
+      };
+
+      log('[DEBUG speakChunk] Calling speechSynthesis.speak() — state before: speaking:', speechSynthesis.speaking, '| pending:', speechSynthesis.pending);
       speechSynthesis.speak(utterance);
+      log('[DEBUG speakChunk] speechSynthesis.speak() called — state after: speaking:', speechSynthesis.speaking, '| pending:', speechSynthesis.pending);
     });
   }
 
@@ -204,31 +222,46 @@
    * Respects pause/stop state.
    */
   async function speakContent(text) {
+    log('[DEBUG speakContent] Called with text length:', text?.length, '| truthy:', !!text, '| trimmed:', !!text?.trim());
+
     if (!text || !text.trim()) {
-      log('No content to speak');
+      log('[DEBUG speakContent] BAILING — no content to speak');
       return;
     }
+
+    log('[DEBUG speakContent] speechSynthesis available:', typeof speechSynthesis !== 'undefined');
+    log('[DEBUG speakContent] speechSynthesis.speaking:', speechSynthesis.speaking, '| pending:', speechSynthesis.pending, '| paused:', speechSynthesis.paused);
 
     STATE.isReading = true;
     STATE.isPaused = false;
     updatePanelState();
 
     const voice = getPreferredVoice();
-    const chunks = chunkText(text);
+    const voices = speechSynthesis.getVoices();
+    log('[DEBUG speakContent] Available voices:', voices.length, '| selected voice:', voice?.name || 'system default');
 
-    log(`Speaking ${chunks.length} chunk(s), ${text.length} chars total`);
+    const chunks = chunkText(text);
+    log(`[DEBUG speakContent] Speaking ${chunks.length} chunk(s), ${text.length} chars total`);
+    log('[DEBUG speakContent] First chunk preview (100 chars):', chunks[0]?.substring(0, 100));
 
     try {
-      for (const chunk of chunks) {
-        if (!STATE.isReading) break; // Stopped by user
-        await speakChunk(chunk, voice);
+      for (let i = 0; i < chunks.length; i++) {
+        if (!STATE.isReading) {
+          log('[DEBUG speakContent] Stopped by user at chunk', i);
+          break;
+        }
+        log(`[DEBUG speakContent] Starting chunk ${i + 1}/${chunks.length}, length: ${chunks[i].length}`);
+        await speakChunk(chunks[i], voice);
+        log(`[DEBUG speakContent] Chunk ${i + 1} finished`);
       }
     } catch (err) {
-      log('TTS error:', err);
+      log('[DEBUG speakContent] TTS error:', err);
+      log('[DEBUG speakContent] Error type:', err?.type, '| error message:', err?.message, '| error:', JSON.stringify(err, Object.getOwnPropertyNames(err || {})));
     } finally {
       STATE.isReading = false;
       STATE.isPaused = false;
       updatePanelState();
+      log('[DEBUG speakContent] Done — final state: speaking:', speechSynthesis.speaking, '| pending:', speechSynthesis.pending);
     }
   }
 
@@ -269,9 +302,8 @@
   // ═══════════════════════════════════════════════════════════════════════════
   // CONTENT EXTRACTION
   //
-  // Open edX architecture: the course content is rendered inside an iframe
-  // with class "chromeless". The script runs on the parent MFE page and
-  // reaches into the iframe's contentDocument for extraction.
+  // Runs in the IFRAME context. Extracts readable text from the xblock
+  // content and responds to postMessage requests from the parent.
   //
   // Content structure inside iframe:
   //   div.content-wrapper#content
@@ -296,16 +328,18 @@
   function getContentDocument() {
     if (SELECTORS.contentIframe) {
       const iframe = document.querySelector(SELECTORS.contentIframe);
+      log('[DEBUG getContentDoc] iframe selector:', SELECTORS.contentIframe, '| found:', !!iframe, '| src:', iframe?.src?.substring(0, 80));
       if (iframe) {
         try {
           const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+          log('[DEBUG getContentDoc] iframeDoc accessible:', !!iframeDoc, '| readyState:', iframeDoc?.readyState);
           if (iframeDoc) return iframeDoc;
         } catch (e) {
-          log('Cannot access iframe (cross-origin?):', e.message);
+          log('[DEBUG getContentDoc] Cannot access iframe (cross-origin?):', e.message);
         }
       }
     }
-    // Fallback: content is in current document (direct access or non-MFE)
+    log('[DEBUG getContentDoc] Falling back to parent document');
     return document;
   }
 
@@ -315,17 +349,21 @@
    */
   function extractContent() {
     const doc = getContentDocument();
+    log('[DEBUG extract] Got document:', doc === document ? 'parent' : 'iframe', '| readyState:', doc.readyState);
 
     if (!SELECTORS.contentArea) {
-      log('SELECTORS.contentArea not configured');
+      log('[DEBUG extract] SELECTORS.contentArea not configured');
       return '';
     }
 
     const contentEl = doc.querySelector(SELECTORS.contentArea);
     if (!contentEl) {
-      log('Content area not found:', SELECTORS.contentArea);
+      log('[DEBUG extract] Content area not found with selector:', SELECTORS.contentArea);
+      log('[DEBUG extract] Available elements in doc:', [...doc.querySelectorAll('main, #main, [role="main"], .course-content, .xblock')].map(el => `${el.tagName}#${el.id}.${el.className}`));
       return '';
     }
+
+    log('[DEBUG extract] Found content element:', contentEl.tagName, '| innerHTML length:', contentEl.innerHTML.length);
 
     // Clone to avoid mutating the live DOM
     const clone = contentEl.cloneNode(true);
@@ -370,56 +408,113 @@
       paragraphs.push(currentBlock.trim());
     }
 
-    return paragraphs.join('\n\n');
+    const result = paragraphs.join('\n\n');
+    log('[DEBUG extract] Extracted text length:', result.length, '| paragraphs:', paragraphs.length);
+    if (result.length > 0) {
+      log('[DEBUG extract] First 200 chars:', result.substring(0, 200));
+    }
+    return result;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // IFRAME CONTENT PROVIDER
+  //
+  // The content iframe is cross-origin (e.g. cgp-oex.wgu.edu vs the parent
+  // MFE on a different *.wgu.edu subdomain), so the parent cannot access
+  // iframe.contentDocument. Instead, the script runs in BOTH contexts:
+  //
+  //   Iframe instance:  Extracts content locally, responds via postMessage
+  //   Parent instance:  Requests content via postMessage, handles TTS/UI/nav
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  if (window !== window.top) {
+    log('Running in iframe context — setting up content provider');
+
+    window.addEventListener('message', (e) => {
+      if (e.data?.type !== 'a11y-reader-extract') return;
+
+      log('[iframe] Content request received, id:', e.data.id);
+      const content = extractContent();
+      log('[iframe] Extracted', content.length, 'chars');
+
+      window.parent.postMessage({
+        type: 'a11y-reader-content',
+        id: e.data.id,
+        content: content,
+      }, '*');
+    });
+
+    log('Iframe content provider ready');
+    return;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Below here: PARENT CONTEXT ONLY (TTS, UI, navigation, hotkeys)
+  // ═══════════════════════════════════════════════════════════════════════════
+
   /**
-   * Wait for the content area to appear in the DOM after navigation.
-   * Watches both the parent document (for iframe load) and, if accessible,
-   * the iframe's document (for content render).
-   * Returns a Promise that resolves with the content text, or rejects on timeout.
+   * Request content from the iframe via postMessage.
+   * Returns a Promise that resolves with the content text.
    */
-  function waitForContent() {
+  function requestContentFromIframe(timeout = 5000) {
     return new Promise((resolve, reject) => {
-      // Check immediately
-      const immediate = extractContent();
-      if (immediate) {
-        resolve(immediate);
+      const iframe = document.querySelector(SELECTORS.contentIframe);
+      if (!iframe?.contentWindow) {
+        log('[DEBUG requestContent] No iframe or contentWindow found');
+        reject(new Error('No iframe found'));
         return;
       }
 
-      const timeout = setTimeout(() => {
-        observer.disconnect();
-        reject(new Error('Content load timeout'));
-      }, CONFIG.CONTENT_LOAD_TIMEOUT);
+      const id = Math.random().toString(36).slice(2);
+      log('[DEBUG requestContent] Sending request, id:', id);
 
-      // Watch the parent document for iframe changes
-      const observer = new MutationObserver(() => {
-        const content = extractContent();
-        if (content) {
-          clearTimeout(timeout);
-          observer.disconnect();
-          resolve(content);
+      const timer = setTimeout(() => {
+        window.removeEventListener('message', handler);
+        log('[DEBUG requestContent] Timeout waiting for iframe response, id:', id);
+        reject(new Error('Iframe content request timeout'));
+      }, timeout);
+
+      function handler(e) {
+        if (e.data?.type === 'a11y-reader-content' && e.data.id === id) {
+          clearTimeout(timer);
+          window.removeEventListener('message', handler);
+          log('[DEBUG requestContent] Got response:', (e.data.content || '').length, 'chars');
+          resolve(e.data.content || '');
         }
-      });
+      }
 
-      observer.observe(document.body, { childList: true, subtree: true });
+      window.addEventListener('message', handler);
+      iframe.contentWindow.postMessage({ type: 'a11y-reader-extract', id }, '*');
+    });
+  }
 
-      // Also poll for iframe content (MutationObserver doesn't fire for
-      // cross-document iframe loads)
-      const poll = setInterval(() => {
-        const content = extractContent();
-        if (content) {
-          clearInterval(poll);
-          clearTimeout(timeout);
-          observer.disconnect();
-          resolve(content);
+  /**
+   * Wait for content to become available after navigation.
+   * Polls the iframe via postMessage until content is returned or timeout.
+   */
+  function waitForContent() {
+    return new Promise((resolve, reject) => {
+      const deadline = Date.now() + CONFIG.CONTENT_LOAD_TIMEOUT;
+
+      async function attempt() {
+        try {
+          const content = await requestContentFromIframe(3000);
+          if (content && content.trim()) {
+            resolve(content);
+            return;
+          }
+        } catch (_) {
+          // iframe not ready yet
         }
-      }, CONFIG.CONTENT_LOAD_POLL_INTERVAL);
 
-      // Clean up poll on timeout
-      const origTimeout = timeout;
-      setTimeout(() => clearInterval(poll), CONFIG.CONTENT_LOAD_TIMEOUT);
+        if (Date.now() < deadline) {
+          setTimeout(attempt, CONFIG.CONTENT_LOAD_POLL_INTERVAL);
+        } else {
+          reject(new Error('Content load timeout'));
+        }
+      }
+
+      attempt();
     });
   }
 
@@ -532,17 +627,19 @@
 
     if (CONFIG.AUTO_READ_ON_NAVIGATE) {
       try {
+        log('[DEBUG navigateNext] Waiting for URL change...');
         await waitForUrlChange(oldUrl);
-        // Brief delay for iframe to begin reloading with new content
+        log('[DEBUG navigateNext] URL changed, waiting 300ms for iframe...');
         await new Promise(r => setTimeout(r, 300));
+        log('[DEBUG navigateNext] Calling waitForContent...');
         const content = await waitForContent();
+        log('[DEBUG navigateNext] waitForContent returned:', content ? `${content.length} chars` : 'EMPTY/NULL');
         await speakContent(content);
       } catch (err) {
-        log('Auto-read failed:', err.message);
+        log('[DEBUG navigateNext] Auto-read failed:', err.message);
       }
     }
 
-    // Refresh menu state after MFE re-renders the sequence bar
     STATE.menuItems = parseMenu();
     detectCurrentPosition();
     updatePanelState();
@@ -567,12 +664,16 @@
 
     if (CONFIG.AUTO_READ_ON_NAVIGATE) {
       try {
+        log('[DEBUG navigatePrev] Waiting for URL change...');
         await waitForUrlChange(oldUrl);
+        log('[DEBUG navigatePrev] URL changed, waiting 300ms for iframe...');
         await new Promise(r => setTimeout(r, 300));
+        log('[DEBUG navigatePrev] Calling waitForContent...');
         const content = await waitForContent();
+        log('[DEBUG navigatePrev] waitForContent returned:', content ? `${content.length} chars` : 'EMPTY/NULL');
         await speakContent(content);
       } catch (err) {
-        log('Auto-read failed:', err.message);
+        log('[DEBUG navigatePrev] Auto-read failed:', err.message);
       }
     }
 
@@ -781,12 +882,21 @@
   // ═══════════════════════════════════════════════════════════════════════════
 
   async function readCurrentPage() {
+    log('[DEBUG readCurrentPage] Triggered');
     stopTTS();
-    const content = extractContent();
-    if (content) {
-      await speakContent(content);
-    } else {
-      log('No content found on current page');
+    try {
+      log('[DEBUG readCurrentPage] Requesting content from iframe...');
+      const content = await requestContentFromIframe();
+      log('[DEBUG readCurrentPage] Got content:', content ? `${content.length} chars` : 'EMPTY/NULL');
+      if (content && content.trim()) {
+        log('[DEBUG readCurrentPage] Calling speakContent...');
+        await speakContent(content);
+        log('[DEBUG readCurrentPage] speakContent returned');
+      } else {
+        log('[DEBUG readCurrentPage] No content found on current page');
+      }
+    } catch (err) {
+      log('[DEBUG readCurrentPage] Failed to get content:', err.message);
     }
   }
 
